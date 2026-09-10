@@ -35,9 +35,12 @@ int initialize_rpi(void) {
 		ret = -1;
 	}
 	
+	/* Offsets are specified in bytes; division by four converts them to
+	 * uint32_t-pointer offsets within the mapped peripheral window. */
 	GPIOBase = PERIBase + 0xD0000 / 4;
 	RIOBase  = PERIBase + 0xE0000 / 4;
 	PADBase  = PERIBase + 0xF0000 / 4;
+	/* Skip the first pad-bank register to address per-pin pad controls. */
 	Pad = PADBase + 1;
 	
 	printk(KERN_INFO "GPIO ready for use\n");
@@ -63,6 +66,7 @@ void deinitialize_rpi(void) {
 void initialize_gpio_for_output(uint32_t pin) {
     GPIO[pin].ctrl=GPIO_FUNC_RIO;
     Pad[pin] = PAD_FUNC_OUT;
+    /* The SET alias changes only the selected output-enable bit. */
     rioSET->oe = 0x01<<pin; 	// output driver
 }
 
@@ -74,6 +78,7 @@ void initialize_gpio_for_output(uint32_t pin) {
 void initialize_gpio_for_input(uint32_t pin) {
 	GPIO[pin].ctrl=GPIO_FUNC_RIO;
     Pad[pin] = PAD_FUNC_IN;
+    /* Disable the output driver so external hardware can drive this input. */
     rioCLR->oe = 0x01<<pin; 	// high impedance
 }
 
@@ -84,6 +89,7 @@ void initialize_gpio_for_input(uint32_t pin) {
  */
 void set_pin(uint32_t pin) {
 	rioSET->oe = 0x01<<pin; 	// output driver
+	/* Write-one SET avoids a software read-modify-write of unrelated pins. */
 	rioSET->out = 0x01<<pin;
 }
 
@@ -94,6 +100,7 @@ void set_pin(uint32_t pin) {
  */
 void clr_pin(uint32_t pin) {
 	rioSET->oe  = 0x01<<pin; 	// output driver
+	/* Write-one CLR lowers only the selected pin. */
 	rioCLR->out = 0x01<<pin;
 }
 
@@ -103,6 +110,7 @@ void clr_pin(uint32_t pin) {
  * Read one bit from the RIO input register. Pin is a GPIO number.
  */
 uint32_t read_pin(uint32_t pin) {
+	/* Shift the requested GPIO to bit zero, then mask off all other inputs. */
 	return (rio->in>>pin & 0x01);
 }
 

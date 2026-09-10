@@ -73,12 +73,14 @@ static int rb2_rp1_pio_init(struct device *dev)
 
     if (gctx_ready) return 0;
 
+    /* Allocate one context for the lifetime of the module; open files share it. */
     gctx = kzalloc(sizeof(*gctx), GFP_KERNEL);
     if (!gctx) return -ENOMEM;
 
     ret = configure_rx_iq_sm(gctx);
     if (ret) goto err_free;
 
+    /* RX can already be receiving here, so a TX failure must also unwind RX. */
     ret = configure_tx_iq_sm(gctx);
     if (ret) goto err_rx;
 
@@ -165,9 +167,11 @@ static void radioberry_align_fifo_on_meta0(struct radioberry_stream *rx)
             return;
         }
 
+        /* Peek at one [metadata, sample-high, sample-mid, sample-low] record. */
         kfifo_out_peek(&rx->dma_fifo, tmp, 4);
         spin_unlock_irqrestore(&rx->fifo_lock, flags);
 
+        /* Tag zero denotes the first component of the first receiver in a group. */
         if ((tmp[0] & 0x0f) == 0) return;
 
         spin_lock_irqsave(&rx->fifo_lock, flags);
@@ -196,7 +200,11 @@ ssize_t radioberry_read(struct file *file, char __user *buf, size_t count, loff_
 	unsigned int copied;
 	uint8_t read_buf[1024]; 
 	
+	/* Fit whole receiver groups into the protocol frame payload. Each group
+	 * contains six bytes per receiver plus two bytes reserved by the protocol. */
 	int nr_samples = (504 / (6 * rx->nrx + 2)) * rx->nrx;
+	/* Each internal I/Q pair uses two four-byte records, including metadata.
+	 * Existing behaviour: this overwrites the caller-supplied maximum count. */
 	count = nr_samples * 8;
 	long timeout_jiffies = msecs_to_jiffies(1000); 
 
@@ -207,6 +215,8 @@ ssize_t radioberry_read(struct file *file, char __user *buf, size_t count, loff_
 		return -EAGAIN; 
 	}
 	
+	/* Discard leading partial-group records before copying samples. Alignment
+	 * can reduce FIFO occupancy after the readiness test above. */
 	radioberry_align_fifo_on_meta0(rx);
 	
 	unsigned long flags;
@@ -224,6 +234,8 @@ ssize_t radioberry_read(struct file *file, char __user *buf, size_t count, loff_
         num_samples = copied / in_sample_size;  
     }
 
+    /* Compact records forward in place. Destination advances by three bytes
+     * while source advances by four, so no unread source bytes are overwritten. */
     for (size_t i = 0; i < num_samples; i++) {
         size_t in_off  = i * in_sample_size;
         size_t out_off = i * out_sample_size;
@@ -260,6 +272,8 @@ ssize_t radioberry_write(struct file *file, const char __user *buf, size_t len, 
 	struct radioberry_stream *tx = &ctx->tx;
 
     uint8_t *tx_stream;
+    /* The kernel cannot dereference the user buffer directly. Stage a copy
+     * before waiting for space; the current timeout path leaks this allocation. */
     tx_stream = kmalloc(len, GFP_KERNEL);
     if (!tx_stream)
         return -ENOMEM;
@@ -276,6 +290,7 @@ ssize_t radioberry_write(struct file *file, const char __user *buf, size_t len, 
 		return -EAGAIN; 
 	}
 	
+    /* Enqueue only: successful return does not mean the FPGA has received it. */
     ssize_t written = rb2_tx_stream_write(tx, tx_stream, len);
     kfree(tx_stream);
     return written;
@@ -310,6 +325,7 @@ static int radioberry_open(struct inode *inode, struct file *filep)
     kfifo_reset(&gctx->tx.dma_fifo);
     spin_unlock_irqrestore(&gctx->tx.fifo_lock, flags);
 
+    /* Attach the already-running global engines to this open file. */
     filep->private_data = gctx;
 
     pr_info("radioberry: streaming enabled (RX SM %d, TX SM %d)\n", gctx->rx.sm, gctx->tx.sm);
@@ -364,6 +380,8 @@ static long radioberry_ioctl(struct file *fp, unsigned int cmd, unsigned long ar
 			
 			rc = copy_from_user(rb_info, (void *)arg, sizeof(struct rb_info_arg_t));
 			
+			/* Construct the SPI byte stream explicitly, independent of host byte order:
+			 * board-control byte, command byte, then four command-data bytes MSB first. */
 			data[0] = ( rb_info->rb_command           & 0xFF); //MSB  
 			data[1] = ( rb_info->command              & 0xFF);
 			data[2] = ((rb_info->command_data >> 24)  & 0xFF);
@@ -372,6 +390,8 @@ static long radioberry_ioctl(struct file *fp, unsigned int cmd, unsigned long ar
 			data[5] = ( rb_info->command_data         & 0xFF);
 			
 			//printk(KERN_INFO "Command kernel %2X - %2X - %2X - %2X - %2X - %2X \n", data[0], data[1], data[2], data[3], data[4], data[5]);
+			/* Addresses zero and one share this configuration format. Bits 5:3
+			 * encode receiver count minus one; retain bit zero for its protocol meaning. */
 			if ((data[1] & 0xFE)  == 0x00) lnrx = ((data[5] & 0x38) >> 3) + 1;
 	
 			rb2_trx_control(data, data, 6); //spi channel 0 // tell the gateware the command.
@@ -385,11 +405,15 @@ static long radioberry_ioctl(struct file *fp, unsigned int cmd, unsigned long ar
 			rb_info_ret.major = data[4];
 			rb_info_ret.minor = data[5];
 			
+			/* Split the returned capability byte: FPGA type [1:0], RX count [5:2],
+			 * TX count [7:6]. These report capabilities, not the active RX count. */
 			rb_info_ret.fpga = data[3] & 0x03; 
 			rb_info_ret.nr   = ((data[3] & 0x3C) >> 2);
 			rb_info_ret.nt 	 = ((data[3] & 0xC0) >> 6);
 			rb_info_ret.version = VERSION_INT; 
 			
+			/* Existing defect: command and command_data in rb_info_ret are uninitialised.
+			 * The complete structure is copied, including those fields. */
 			if (copy_to_user((struct rb_info_arg_t *)arg, &rb_info_ret, sizeof(struct rb_info_arg_t))) return -EACCES;
 	
 			break;
@@ -449,6 +473,8 @@ static int radioberry_probe(struct platform_device *pdev)
         return -ENODEV;
     }
 
+	/* Store the resolved device association; sample setup later opens its
+	 * own RP1 clients rather than receiving this pointer as an argument. */
 	platform_set_drvdata(pdev, pio);  
 
 	dev_info(dev, "Radioberry probe finished\n");

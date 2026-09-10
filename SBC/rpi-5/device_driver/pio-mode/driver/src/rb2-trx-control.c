@@ -19,6 +19,8 @@ int rb2_trx_initialize() {
 	printk(KERN_INFO "initialize_firmware: make GPIO ready for rx and tx streaming...\n");
 	
 	// Radioberry control using SPI Mode Pins
+	/* These are RP1 pin function selectors, not SPI transactions. Sample
+	 * pins are subsequently switched to the PIO function during stream setup. */
 	setPinMode(RPI_SPI_CE0,  GPIO_FUNC_SPI);
 	setPinMode(RPI_SPI_CE1,  GPIO_FUNC_SPI);
 
@@ -60,6 +62,8 @@ int rb2_trx_initialize() {
  */
 int rb2_trx_control(char *txBuf, char *rxBuf, unsigned cnt){
 	
+	/* One full-duplex transfer: each transmitted byte clocks in a response byte.
+	 * The control ioctl uses the same six-byte storage for TX and RX. */
 	struct spi_transfer t = {
 		.tx_buf = txBuf,
 		.rx_buf = rxBuf,
@@ -68,9 +72,11 @@ int rb2_trx_control(char *txBuf, char *rxBuf, unsigned cnt){
 	struct spi_message m;
 
 	spi_message_init(&m);
+	/* Attach the transfer descriptor; its stack lifetime lasts through spi_sync. */
 	spi_message_add_tail(&t, &m);
 	
 	// Send and receive the control message to/from the Radioberry SPI device
+	/* Synchronous call can sleep until the controller completes or reports error. */
 	int ret = spi_sync(spi_ctrl_dev, &m);
 	if (ret) {
 		pr_err("SPI transfer failed\n");

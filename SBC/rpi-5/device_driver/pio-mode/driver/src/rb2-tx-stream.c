@@ -114,6 +114,7 @@ int configure_tx_iq_sm(struct radioberry_client_ctx *ctx)
 	pr_info("radioberry: SM %d disabled for TX\n", ctx->tx.sm);
 	
 	
+    /* Ask the external RP1 driver for two 16 KiB TO_SM transfer buffers. */
     ret = rp1_pio_sm_config_xfer(ctx->tx.client, ctx->tx.sm, PIO_DIR_TO_SM, TX_SAMPLE_SIZE, 2);
     if (ret < 0) {
         pr_err("radioberry: Failed to configure TX DMA %d\n", ret);
@@ -123,6 +124,7 @@ int configure_tx_iq_sm(struct radioberry_client_ctx *ctx)
 
     struct rp1_pio_add_program_args prog_args;
     prog_args.num_instrs = tx_iq_sample_program.length;
+    /* Allow dynamic placement; the returned offset is used for PC/wrap setup. */
     prog_args.origin = RP1_PIO_ORIGIN_ANY;
     ctx->tx.prog_length = tx_iq_sample_program.length;
     memcpy(prog_args.instrs, tx_iq_sample_program_instructions, ctx->tx.prog_length * sizeof(uint16_t));
@@ -158,6 +160,8 @@ int configure_tx_iq_sm(struct radioberry_client_ctx *ctx)
         goto error_cleanup;
     }
 
+	/* Keep ready low when it is undriven. The FPGA must assert this input
+	 * before the PIO program begins a word. */
 	struct rp1_gpio_set_pulls_args pulls = {
 		.gpio = TX_SAMPLE_READY_PIN,
 		.up = false,
@@ -200,14 +204,23 @@ int configure_tx_iq_sm(struct radioberry_client_ctx *ctx)
     struct rp1_pio_sm_init_args config_args;
     config_args.sm = ctx->tx.sm;
     config_args.initial_pc = ctx->tx.prog_offset;
+    /* PIO divider uses a 16.8 fixed-point layout here: integer divisor eight.
+     * Actual clock frequency also depends on the RP1 PIO source clock. */
     config_args.config.clkdiv 		= 0x00080000;        
+    /* Select GPIO 12 for JMP PIN and enable optional clock side-set. */
     config_args.config.execctrl 	= 0x4c01fb80; 
+	/* Replace only the five-bit wrap-top [16:12] and wrap-bottom [11:7]
+	 * fields, leaving jump-pin and side-set control untouched. */
 	config_args.config.execctrl &= ~((0x1Fu << 12) | (0x1Fu << 7));
 	uint32_t wrap_bottom = ctx->tx.prog_offset + tx_iq_sample_wrap_target;
 	uint32_t wrap_top    = ctx->tx.prog_offset + tx_iq_sample_wrap;
 	config_args.config.execctrl |= (wrap_top    & 0x1F) << 12;
 	config_args.config.execctrl |= (wrap_bottom & 0x1F) << 7;
+    /* Zero selects left shift and disables autopull. PULL BLOCK in the PIO
+     * program explicitly loads each word, then OUT emits its most significant bit. */
     config_args.config.shiftctrl 	= 0x00000000;  
+    /* OUT base GPIO 5, one data pin; side-set base GPIO 4. Two encoded
+     * side-set bits represent one optional-enable bit and one clock-value bit. */
     config_args.config.pinctrl		= 0x40101005; 
 	
     ret = rp1_pio_sm_init(ctx->tx.client, &config_args);
@@ -260,6 +273,7 @@ ssize_t rb2_tx_stream_write(struct radioberry_stream *tx, const uint8_t *data, s
     
 	spin_unlock_irqrestore(&tx->fifo_lock, flags);
 
+    /* Schedule outside the FIFO lock. The worker will recheck block availability. */
     if (should_schedule) schedule_work(&tx->dma_restart);
 
     return written;
@@ -285,10 +299,13 @@ static void tx_dma_kick_now(struct radioberry_stream *tx)
         avail = kfifo_len(&tx->dma_fifo);
     spin_unlock_irqrestore(&tx->fifo_lock, flags);
 
+    /* Never launch a partial block: short tails wait for more application data. */
     if (avail < tx->dma_size) {
         atomic_set(&tx->dma_running, 0);
         return;
     }
+    /* Atomically claim submission ownership; a prior value of one means another
+     * path already considers a transfer active. */
     if (atomic_xchg(&tx->dma_running, 1)) {
         pr_info("tx_dma_kick_now: DMA already running, skip");
         return;
@@ -301,12 +318,16 @@ static void tx_dma_kick_now(struct radioberry_stream *tx)
         size_t actual = kfifo_out(&tx->dma_fifo, iq_buf, tx->dma_size);
     spin_unlock_irqrestore(&tx->fifo_lock, flags);
 
+    /* Obtain the CPU mapping of the selected external DMA buffer. FIFO bytes
+     * have already been removed above, so lookup failure loses that block. */
     uint32_t *tx_words = rp1_pio_sm_buffer_virt(tx->client, tx->sm, PIO_DIR_TO_SM, proc_buf);
     if (!tx_words) {
         pr_err("radioberry: NULL buffer_virt in TX kick!\n");
         atomic_set(&tx->dma_running, 0);
         return;
     }
+    /* Combine [I_hi, I_lo, Q_hi, Q_lo] into one numerical 32-bit word.
+     * For example, bytes 12 34 AB CD become word 0x1234ABCD. */
     for (size_t i = 0; i < (actual / sizeof(uint32_t)); i++) {
         tx_words[i] = ((iq_buf[i*4+0] << 24) |
                        (iq_buf[i*4+1] << 16) |
@@ -314,7 +335,11 @@ static void tx_dma_kick_now(struct radioberry_stream *tx)
                         iq_buf[i*4+3]);
     }
 	
+    /* Order writes to the DMA buffer before asking the device to consume it.
+     * Allocation/mapping coherence remains the external RP1 driver responsibility. */
     dma_wmb();
+    /* Submit memory-to-PIO transfer. Completion will advance the selected
+     * buffer and decide whether enough queued bytes exist for another block. */
     int ret = rp1_pio_sm_xfer_data(tx->client, tx->sm, PIO_DIR_TO_SM,
                                    actual, tx_words, 0,
                                    tx_iq_data_dma_callback, tx);
@@ -350,6 +375,8 @@ void tx_iq_data_dma_callback(void *param)
     size_t avail;
     unsigned long flags;
 
+    /* Toggle 0/1 after completion. This code submits the next transfer explicitly;
+     * two buffers alone do not imply two concurrently active DMA transfers. */
     tx->active_buffer = (tx->active_buffer + 1) & 1;
     atomic_set(&tx->dma_running, 0);
 
@@ -357,6 +384,8 @@ void tx_iq_data_dma_callback(void *param)
         avail = kfifo_len(&tx->dma_fifo);
     spin_unlock_irqrestore(&tx->fifo_lock, flags);
 
+    /* Continue directly from callback context for a full block. Otherwise defer
+     * a recheck. No TX-space wakeup is issued here for blocked writers. */
     if (avail >= tx->dma_size) tx_dma_kick_now(tx); else schedule_work(&tx->dma_restart);
 }
 
@@ -414,15 +443,15 @@ void radioberry_cleanup_tx_ctx(struct radioberry_client_ctx *ctx)
  */
 const uint16_t tx_iq_sample_program_instructions[] = {
             //     .wrap_target
-    0x1ac2, //  0: jmp    pin, 2          side 1 [2]
-    0x1200, //  1: jmp    0               side 0 [2]
-    0xb242, //  2: nop                    side 0 [2]
-    0xe03f, //  3: set    x, 31
-    0x80a0, //  4: pull   block
-    0x6001, //  5: out    pins, 1
-    0xba42, //  6: nop                    side 1 [2]
-    0x1245, //  7: jmp    x--, 5          side 0 [2]
-    0x0000, //  8: jmp    0
+    0x1ac2, //  0: jmp    pin, 2          side 1 [2]; Poll FPGA ready with clock high
+    0x1200, //  1: jmp    0               side 0 [2]; Ready low: clock low and retry
+    0xb242, //  2: nop                    side 0 [2]; Lower clock before loading word
+    0xe03f, //  3: set    x, 31; 32 iterations from counter value 31
+    0x80a0, //  4: pull   block; Stall here until a DMA-fed word is available
+    0x6001, //  5: out    pins, 1; Emit next I/Q bit on GPIO 5
+    0xba42, //  6: nop                    side 1 [2]; Clock high phase for this data bit
+    0x1245, //  7: jmp    x--, 5          side 0 [2]; Clock low and repeat until all 32 bits sent
+    0x0000, //  8: jmp    0; Begin the next ready handshake
             //     .wrap
 };
 

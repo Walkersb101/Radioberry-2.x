@@ -137,6 +137,7 @@ int configure_rx_iq_sm(struct radioberry_client_ctx *ctx)
 	}
 	pr_info("radioberry: SM %d disabled for RX\n", ctx->rx.sm);
 	
+	/* Configure two 24 KiB FROM_SM buffers in the external RP1 driver. */
 	ret = rp1_pio_sm_config_xfer(ctx->rx.client, ctx->rx.sm, PIO_DIR_FROM_SM, SAMPLE_SIZE, 2);
 	if (ret < 0) {
 		pr_err("radioberry: Failed to configure DMA %d\n", ret);
@@ -146,6 +147,7 @@ int configure_rx_iq_sm(struct radioberry_client_ctx *ctx)
 	
 	struct rp1_pio_add_program_args prog_args;
     prog_args.num_instrs = rx_iq_sample_program.length;
+    /* Program location is allocated dynamically; remember it for wrap and cleanup. */
     prog_args.origin = RP1_PIO_ORIGIN_ANY;
 	ctx->rx.prog_length = rx_iq_sample_program.length;
 	memcpy(prog_args.instrs, rx_iq_sample_program_instructions, ctx->rx.prog_length * sizeof(uint16_t));
@@ -232,14 +234,21 @@ int configure_rx_iq_sm(struct radioberry_client_ctx *ctx)
 	struct rp1_pio_sm_init_args config_args;
 	config_args.sm = ctx->rx.sm;
 	config_args.initial_pc = ctx->rx.prog_offset;
+	/* Integer PIO clock divisor two; this is not the radio sample rate. */
 	config_args.config.clkdiv 		= 0x00020000;
+	/* Use GPIO 25 for JMP PIN and optional side-set for the RX clock. */
 	config_args.config.execctrl 	= 0x5901f600;
+	/* Clear the encoded wrap bounds before adding the allocated program offset. */
 	config_args.config.execctrl &= ~((0x1Fu << 12) | (0x1Fu << 7));
 	uint32_t wrap_bottom = ctx->rx.prog_offset + rx_iq_sample_wrap_target;
 	uint32_t wrap_top    = ctx->rx.prog_offset + rx_iq_sample_wrap;
 	config_args.config.execctrl |= (wrap_top    & 0x1F) << 12;
 	config_args.config.execctrl |= (wrap_bottom & 0x1F) << 7;
+	/* Left-shift incoming nibbles and autopush after 28 bits: four metadata
+	 * bits plus one 24-bit sample component in each 32-bit FIFO word. */
 	config_args.config.shiftctrl 	= 0x01c10000;
+	/* Input base GPIO 18 gives pins 18..21 to IN PINS,4. Clock side-set
+	 * starts at GPIO 6 and uses an optional-enable bit plus one clock-value bit. */
 	config_args.config.pinctrl 		= 0x40091800;
 	
 
@@ -291,12 +300,15 @@ void dma_restart_work(struct work_struct *w)
 {
     struct radioberry_stream *rx = container_of(w, struct radioberry_stream, dma_restart);
 
+	/* Do not submit another transfer if this stream is already marked running. */
 	if (atomic_xchg(&rx->dma_running, 1)) {
         return;
     }
 
     int proc_buf = rx->active_buffer;
 
+    /* Use the currently selected external DMA buffer, without allocating
+     * new memory on every restart. */
     void *dst = rp1_pio_sm_buffer_virt(
         rx->client,
         rx->sm,
@@ -309,6 +321,8 @@ void dma_restart_work(struct work_struct *w)
         return;
     }
 
+    /* Request a block from the PIO RX FIFO. Completion handles sample
+     * validation and queues the next restart rather than this worker looping. */
     int ret = rp1_pio_sm_xfer_data(
         rx->client,
         rx->sm,
@@ -353,33 +367,44 @@ void rx_iq_data_dma_callback(void *param)
 	
 	for (size_t i = 0; i < (rx->dma_size / sizeof(uint32_t)); i++) {
 		
+		/* Ignore the top unused nibble; bits 27:24 identify this component position. */
 		uint8_t meta = (iq_words[i] >> 24) & 0x0F;
 
+        /* Search for the start of a complete receiver cycle before accepting data. */
         if (!rx->meta_synced) {
             if (meta != 0) continue;       
             rx->meta_synced   = true;
             rx->meta_expected = 0;	
         }
+		/* Lose synchronisation on any unexpected tag. This word is discarded,
+		 * even if it is itself tag zero; recovery waits for a later zero tag. */
 		if (meta != rx->meta_expected) {
                 rx->meta_synced   = false;
                 continue;
         }
+		/* Store an explicit byte representation, avoiding dependence on the
+		 * host-endian layout of the DMA word. */
 		iq_buf[iq_count++] = (iq_words[i] >> 24) & 0x0F;  
 		iq_buf[iq_count++] = (iq_words[i] >> 16) & 0xFF;   
 		iq_buf[iq_count++] = (iq_words[i] >>  8) & 0xFF;   
 		iq_buf[iq_count++] = (iq_words[i] >>  0) & 0xFF; 
 
+        /* There are two components per receiver; advance across all active receivers. */
         if (++rx->meta_expected >= 2 * rx->nrx) rx->meta_expected = 0;  
     }
 
 	unsigned long flags;
 	spin_lock_irqsave(&rx->fifo_lock, flags);
 	{
+	/* Existing overrun policy: discard the old queue rather than truncate this
+	 * new batch. There is no reader-visible loss counter here. */
 	if (kfifo_avail(&rx->dma_fifo) < iq_count) kfifo_reset(&rx->dma_fifo);
 	unsigned copied = kfifo_in(&rx->dma_fifo, iq_buf, iq_count);
 	}
 	spin_unlock_irqrestore(&rx->fifo_lock, flags);
 
+    /* Readers may now satisfy their byte-count condition. Switch buffers and
+     * resubmit through work after publishing this batch. */
     wake_up_interruptible(&rx->queue);
     rx->active_buffer = (proc_buf + 1) & 1;
 	atomic_set(&rx->dma_running, 0);
@@ -441,24 +466,24 @@ void radioberry_cleanup_rx_ctx(struct radioberry_client_ctx *ctx)
  */
 const uint16_t rx_iq_sample_program_instructions[] = {
             //     .wrap_target
-    0x000f, //  0: jmp    15
-    0xbb42, //  1: nop                    side 1 [3]
-    0x5004, //  2: in     pins, 4         side 0
-    0xbb42, //  3: nop                    side 1 [3]
-    0x5004, //  4: in     pins, 4         side 0
-    0xbb42, //  5: nop                    side 1 [3]
-    0x5004, //  6: in     pins, 4         side 0
-    0xbb42, //  7: nop                    side 1 [3]
-    0x5004, //  8: in     pins, 4         side 0
-    0xbb42, //  9: nop                    side 1 [3]
-    0x5004, // 10: in     pins, 4         side 0
-    0xbb42, // 11: nop                    side 1 [3]
-    0x5004, // 12: in     pins, 4         side 0
-    0xbb42, // 13: nop                    side 1 [3]
-    0x5004, // 14: in     pins, 4         side 0
-    0xba42, // 15: nop                    side 1 [2]
-    0xb242, // 16: nop                    side 0 [2]
-    0x00c1, // 17: jmp    pin, 1
+    0x000f, //  0: jmp    15; Start at handshake instead of reading unready data
+    0xbb42, //  1: nop                    side 1 [3]; Clock high for metadata nibble
+    0x5004, //  2: in     pins, 4         side 0; Capture metadata nibble
+    0xbb42, //  3: nop                    side 1 [3]; Clock high for sample bits 23:20
+    0x5004, //  4: in     pins, 4         side 0; Capture sample bits 23:20
+    0xbb42, //  5: nop                    side 1 [3]; Clock high for sample bits 19:16
+    0x5004, //  6: in     pins, 4         side 0; Capture sample bits 19:16
+    0xbb42, //  7: nop                    side 1 [3]; Clock high for sample bits 15:12
+    0x5004, //  8: in     pins, 4         side 0; Capture sample bits 15:12
+    0xbb42, //  9: nop                    side 1 [3]; Clock high for sample bits 11:8
+    0x5004, // 10: in     pins, 4         side 0; Capture sample bits 11:8
+    0xbb42, // 11: nop                    side 1 [3]; Clock high for sample bits 7:4
+    0x5004, // 12: in     pins, 4         side 0; Capture sample bits 7:4
+    0xbb42, // 13: nop                    side 1 [3]; Clock high for sample bits 3:0
+    0x5004, // 14: in     pins, 4         side 0; Capture final nibble; 28-bit autopush threshold reached
+    0xba42, // 15: nop                    side 1 [2]; Handshake clock high
+    0xb242, // 16: nop                    side 0 [2]; Handshake clock low
+    0x00c1, // 17: jmp    pin, 1; Ready high enters next word; low wraps to PC 0
             //     .wrap
 };
 

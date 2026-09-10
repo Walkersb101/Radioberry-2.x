@@ -31,10 +31,12 @@ void upload_gateware_byte( int one_byte ) {
 	/* write from LSb to MSb */
 	for ( i = 0; i < 8; i++ )
 	{
+		/* Select bit i without modifying the original byte; i increases from LSB. */
 		bit = one_byte >> i;
 		bit = bit & 0x1;
 		
 		if (bit) set_pin(oPinDATA); else clr_pin(oPinDATA); 
+		/* Allow DATA to settle before the CPU-generated configuration clock pulse. */
 		udelay(1);
 		set_pin(oPinDCLK);
 		clr_pin(oPinDCLK);
@@ -55,12 +57,14 @@ int prepare_gateware_loading() {
 	clr_pin(oPinDATA);
 	clr_pin(oPinDCLK);
  
+	/* Hold configuration reset low for one second before releasing NCONFIG. */
 	msleep(1000);
 	
 	set_pin(oPinNCONFIG);
 
 	int count = 0;
 	
+	/* Wait for the FPGA configuration interface, not sample-stream readiness. */
 	while (read_pin(iPinNSTATUS) == 0) {
 		count++;
 		msleep(1000);
@@ -133,11 +137,13 @@ void firmware_load(char *firmware, int size) {
 	
 	u8 *buf = kmalloc(size + 1, GFP_KERNEL);
 	memcpy(buf, firmware, size);
+	/* The extra terminator is not part of the binary image and is not uploaded. */
 	buf[size] = '\0';
 
 	printk(KERN_INFO "Radioberry gateware file size: %d\n", size);
 
 	initialize_gateware();
+	/* Existing behaviour ignores preparation failure and proceeds with upload. */
 	prepare_gateware_loading();
 	int b = 0;
 	for (b = 0; b < size; b++) {
@@ -159,6 +165,8 @@ void loading_radioberry_gateware(struct device *dev) {
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);
 	
 	const struct firmware *fw_entry;
+	/* The kernel firmware loader resolves this filename; the image must match
+	 * the board FPGA. This path does not select an FPGA variant automatically. */
 	if (request_firmware(&fw_entry, "radioberry.rbf", dev) != 0 ) {
 		   printk(KERN_ERR "gateware radioberry.rbf: Firmware not available\n");
 		   return;
@@ -166,6 +174,7 @@ void loading_radioberry_gateware(struct device *dev) {
 
 	firmware_load(fw_entry->data, fw_entry->size);
 
+	/* Return the firmware-loader object after the synchronous upload finishes. */
 	release_firmware(fw_entry);
 }
 
