@@ -228,3 +228,7 @@ On the existing radio interface, those halves are still interpreted as I/Q. The 
 The helper can be compiled and its first symbol transitions checked without hardware. Those checks validate packing and message sequencing only. They do not validate TX enable, RF frequency, spectral shape, DMA continuity or finite-burst completion. No radio test is claimed for these snippets.
 
 Validation of the included helper: compiled as C11 with `-Wall -Wextra -Werror`; checked all 768 generated samples over two complete repetitions of 0xA5, including sign patterns, zero Q, and 48-sample symbol boundaries. Passed. These are host-only checks.
+
+## C++ prototype implementation
+
+A minimal [C++17 command-line transmitter](../../../../utility/minimal-tx-cpp/README.md) now implements the sample path described above. It accepts bit strings, generates rectangular BPSK I/Q or literal raw 32-bit words, pads complete DMA blocks, supports file output and accepts explicit start/stop control sequences. It reuses the unchanged kernel driver. Its host tests do not establish hardware completion or a gateware control configuration.
