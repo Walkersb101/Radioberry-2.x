@@ -16,6 +16,13 @@ The radio gateware interprets received words as I/Q even in raw mode. Raw bits
 are not automatically an RF packet. BPSK is a basic waveform demonstration,
 without pulse shaping, a preamble, error correction or a receiver protocol.
 
+## Learn the implementation
+
+Start with [LEARNING_GUIDE.md](LEARNING_GUIDE.md), then read the heavily
+commented [tx.cpp](tx.cpp). The guide traces a four-bit example through signed
+I/Q packing and 16 KiB blocks, explains C++ ownership and Linux I/O, and includes
+offline exercises with answers. The Makefile and tests are also annotated.
+
 ## Build
 
 On Linux, from this directory:
