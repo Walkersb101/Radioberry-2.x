@@ -6,6 +6,9 @@
 
 #define RADIOBERRY_MAGIC	('x')
 
+/* Existing ABI: encoded as a one-byte write, but handler copies the full
+ * rb_info_arg_t in both directions. Do not change the number in only one
+ * component. See docs/DRIVER_GUIDE.md and docs/REVIEW.md. */
 #define RADIOBERRY_IOC_COMMAND			_IOW(RADIOBERRY_MAGIC, 1, __u8)
 
 struct rb_info_arg_t

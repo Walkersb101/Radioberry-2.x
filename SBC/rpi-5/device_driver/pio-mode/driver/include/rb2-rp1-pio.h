@@ -14,6 +14,12 @@
 #define SAMPLE_SIZE 24576
 #define FIFO_SIZE 	32768  
 
+/*
+ * Per-direction ownership: RP1 client/SM/program, alternating DMA buffers,
+ * byte FIFO, wait queue, restart work and callback scratch storage.
+ * RX alone uses nrx/meta fields. dma_done is currently unused after init.
+ * fifo_lock protects FIFO changes, not all state or callback lifetime.
+ */
 	struct radioberry_stream {
 		
 		//PIO

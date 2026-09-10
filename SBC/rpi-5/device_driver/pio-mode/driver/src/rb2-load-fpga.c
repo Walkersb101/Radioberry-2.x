@@ -17,6 +17,13 @@ void initialize_gateware(void);
 int activate_gateware(void);
 
 
+/*
+ * upload_gateware_byte
+ *
+ * Bit-bang one FPGA configuration byte, least-significant bit first.
+ * For each bit, set DATA, delay one microsecond, then pulse DCLK. This is
+ * configuration traffic; the TX I/Q PIO stream uses a different bit order.
+ */
 void upload_gateware_byte( int one_byte ) {
 	int	bit = 0;
 	int i = 0;
@@ -34,6 +41,13 @@ void upload_gateware_byte( int one_byte ) {
 	}
 }
 
+/*
+ * prepare_gateware_loading
+ *
+ * Hold NCONFIG/DATA/DCLK low, wait one second, release NCONFIG and poll
+ * NSTATUS. Return -1 after the bounded polling failure. The current caller
+ * does not check this return value before uploading the image.
+ */
 int prepare_gateware_loading() {
 	printk(KERN_INFO "Info: prepare FPGA for loading image\n");
 	
@@ -59,6 +73,12 @@ int prepare_gateware_loading() {
 	return 0;
 }
 
+/*
+ * initialize_gateware
+ *
+ * Set configuration status pins as inputs and configuration control pins
+ * as outputs using the direct RP1 RIO register helpers.
+ */
 void initialize_gateware() {
 	
 	initialize_gpio_for_input(iPinCONF_DONE);
@@ -72,6 +92,13 @@ void initialize_gateware() {
 	
 }
 
+/*
+ * activate_gateware
+ *
+ * Check NSTATUS and CONF_DONE, then issue two final DCLK pulses.
+ * The current routine returns zero on both reported failure and success;
+ * its return value therefore cannot distinguish those outcomes.
+ */
 int activate_gateware() {
 		
 	/* Check if loading succeeded*/
@@ -94,6 +121,13 @@ int activate_gateware() {
 	return 0;
 }
 
+/*
+ * firmware_load
+ *
+ * Copy the binary image into a temporary buffer, prepare the FPGA, upload
+ * each byte and activate. The appended zero byte is not transmitted.
+ * The current code does not check kmalloc or propagate loading failures.
+ */
 void firmware_load(char *firmware, int size) {
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);
 	
@@ -114,6 +148,13 @@ void firmware_load(char *firmware, int size) {
 	kfree(buf);
 }
 
+/*
+ * loading_radioberry_gateware
+ *
+ * Request radioberry.rbf from the Linux firmware loader, program it and
+ * release the firmware object. A missing image is logged and returns from
+ * this void routine, so module initialization can continue without gateware.
+ */
 void loading_radioberry_gateware(struct device *dev) {
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);
 	

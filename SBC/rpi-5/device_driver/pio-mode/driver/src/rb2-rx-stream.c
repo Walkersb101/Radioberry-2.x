@@ -49,6 +49,14 @@ const struct pio_program rx_iq_sample_program;
 void dma_restart_work(struct work_struct *w);
 void rx_iq_data_dma_callback(void *param);
 
+/*
+ * radioberry_init_ctx
+ *
+ * Initialize RX FIFO, locks, wait queue, metadata tracking and restart work.
+ * Default receiver count is one. Each DMA block is SAMPLE_SIZE bytes and
+ * buffer indices alternate between zero and one. dma_done completions are
+ * initialized/signalled here but are not used to wait for these transfers.
+ */
 int radioberry_init_ctx(struct radioberry_client_ctx *ctx)
 {
     INIT_KFIFO(ctx->rx.dma_fifo);
@@ -74,6 +82,16 @@ int radioberry_init_ctx(struct radioberry_client_ctx *ctx)
     return 0;
 }
 
+/*
+ * configure_rx_iq_sm
+ *
+ * Configure one RX PIO state machine and two external-driver DMA buffers.
+ * GPIO 18..21 carry four parallel bits, GPIO 25 is ready, and GPIO 6 is the
+ * clock driven using side-set. Load the 18-word program, set pin functions
+ * and directions, relocate wrap limits, enable the SM, and queue first DMA.
+ * State-machine claim/program allocation are dynamic; numeric SM IDs are
+ * not hard-coded. See REVIEW.md for partial-initialization ownership issues.
+ */
 int configure_rx_iq_sm(struct radioberry_client_ctx *ctx)
 {	
 	initialize_gpio_for_output(RX_STREAM_IQ_CLK);
@@ -260,6 +278,15 @@ error_cleanup:
     return ret;	
 }
 
+/*
+ * dma_restart_work
+ *
+ * Submit one RX DMA transfer from process-context work.
+ * atomic_xchg prevents duplicate submissions through this path. The target
+ * is the external RP1 driver buffer selected by active_buffer. On success
+ * the callback handles the completed block and schedules the next transfer.
+ * An error clears dma_running and logs; it does not automatically retry.
+ */
 void dma_restart_work(struct work_struct *w)
 {
     struct radioberry_stream *rx = container_of(w, struct radioberry_stream, dma_restart);
@@ -298,6 +325,17 @@ void dma_restart_work(struct work_struct *w)
 	}
 }
 
+/*
+ * rx_iq_data_dma_callback
+ *
+ * Consume one completed RX block and publish synchronized sample records.
+ * Metadata is bits 27:24. Accept tags 0..(2*nrx-1) cyclically; after a
+ * mismatch discard words until a future zero tag permits resynchronization.
+ * Store accepted words as [meta, sample MSB, middle, LSB]. If software FIFO
+ * space is insufficient, discard its existing contents before inserting.
+ * Wake readers, flip DMA buffer index, clear running, and queue more work.
+ * Callback execution/termination guarantees belong to the external RP1 API.
+ */
 void rx_iq_data_dma_callback(void *param)
 {
 	struct radioberry_stream *rx = param;
@@ -348,6 +386,13 @@ void rx_iq_data_dma_callback(void *param)
 	schedule_work(&rx->dma_restart);
 }
 
+/*
+ * radioberry_cleanup_rx_ctx
+ *
+ * Cancel queued RX restart work, disable the SM, remove its program,
+ * unclaim the SM and close the RP1 client. In-flight callback quiescence
+ * and partial-initialization safety require the separate lifetime audit.
+ */
 void radioberry_cleanup_rx_ctx(struct radioberry_client_ctx *ctx)
 {
 	if (ctx->rx.client && ctx->rx.sm >= 0) { 
@@ -387,6 +432,13 @@ void radioberry_cleanup_rx_ctx(struct radioberry_client_ctx *ctx)
 	}
 }
 
+/*
+ * PIO execution, not ARM instructions: 0 skips to ready polling; 1..14
+ * clock seven four-bit nibbles into ISR; 15/16 pulse the handshake clock;
+ * 17 enters another word when ready is high, otherwise wraps to 0.
+ * Autopush at 28 bits transfers metadata plus a 24-bit component to RX FIFO.
+ * See docs/DRIVER_GUIDE.md for the instruction-by-instruction explanation.
+ */
 const uint16_t rx_iq_sample_program_instructions[] = {
             //     .wrap_target
     0x000f, //  0: jmp    15

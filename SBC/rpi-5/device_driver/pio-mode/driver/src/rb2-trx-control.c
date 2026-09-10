@@ -7,6 +7,13 @@
 struct spi_device *spi_ctrl_dev = NULL;
 
 
+/*
+ * rb2_trx_initialize
+ *
+ * Select SPI pin functions and initialize sample-interface GPIO directions.
+ * PIO configuration later takes ownership of the sample pins. This routine
+ * only sets pins; it does not exchange radio register values with the FPGA.
+ */
 int rb2_trx_initialize() {	
 
 	printk(KERN_INFO "initialize_firmware: make GPIO ready for rx and tx streaming...\n");
@@ -43,6 +50,14 @@ int rb2_trx_initialize() {
 }
 
 
+/*
+ * rb2_trx_control
+ *
+ * Perform one synchronous full-duplex SPI transaction of cnt bytes.
+ * The caller may supply the same buffer for transmit and receive; control
+ * ioctl uses six bytes. Return the SPI status. This function requires a
+ * successfully probed spi_ctrl_dev and can sleep in the SPI subsystem.
+ */
 int rb2_trx_control(char *txBuf, char *rxBuf, unsigned cnt){
 	
 	struct spi_transfer t = {

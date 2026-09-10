@@ -23,3 +23,9 @@ This driver uses the RP1-PIO driver.
 
 I have done a small modification and posted a PR this is not yet accepted!
 
+
+Detailed documentation:
+  docs/DRIVER_GUIDE.md   Architecture, ABI, PIO, DMA and function reference.
+  docs/REVIEW.md         Known findings and validation limitations.
+
+Inline documentation is added without changing executable source tokens.

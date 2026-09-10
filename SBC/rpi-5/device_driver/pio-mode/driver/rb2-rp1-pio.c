@@ -58,6 +58,15 @@ static struct device* radioberryCharDevice = NULL;
 static struct radioberry_client_ctx *gctx;
 static bool gctx_ready;
 
+/*
+ * rb2_rp1_pio_init
+ *
+ * Allocate the module-global RX/TX context and configure both PIO engines.
+ * Called during module loading, not for each open. RX starts before TX setup
+ * finishes. gctx_ready becomes true only after both setups succeed.
+ * The error paths do not consistently unwind partially started engines; see
+ * docs/REVIEW.md before treating initialization failure as safe cleanup.
+ */
 static int rb2_rp1_pio_init(struct device *dev)
 {
     int ret;
@@ -86,6 +95,13 @@ err_free:
     return ret;
 }
 
+/*
+ * rb2_rp1_pio_deinit
+ *
+ * Release both stream contexts, then free the shared allocation.
+ * The external RP1 driver must quiesce DMA callbacks before this memory is
+ * freed; cancellation of work alone is not a DMA completion barrier.
+ */
 static void rb2_rp1_pio_deinit(void)
 {
     if (!gctx) return;
@@ -99,6 +115,13 @@ static void rb2_rp1_pio_deinit(void)
 }
 
 
+/*
+ * spi_ctrl_probe
+ *
+ * Bind the SPI device used for six-byte radio-control exchanges.
+ * spi_ctrl_dev is global and is subsequently consumed by rb2_trx_control().
+ * The pointer is assigned before spi_setup() reports success or failure.
+ */
 static int spi_ctrl_probe(struct spi_device *spi)
 {
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);
@@ -122,6 +145,14 @@ static struct spi_driver radioberry_spi_ctrl_driver = {
     .probe = spi_ctrl_probe,
 };
 
+/*
+ * radioberry_align_fifo_on_meta0
+ *
+ * Discard complete four-byte FIFO records until the first metadata nibble
+ * is zero. This aligns a userspace read to the start of a receiver group.
+ * This can reduce available data after the read readiness check. Each FIFO
+ * operation is locked, but the whole peek-and-discard sequence is not atomic.
+ */
 static void radioberry_align_fifo_on_meta0(struct radioberry_stream *rx)
 {
     uint8_t tmp[4];
@@ -146,6 +177,17 @@ static void radioberry_align_fifo_on_meta0(struct radioberry_stream *rx)
     }
 }
 
+/*
+ * radioberry_read
+ *
+ * Return packed 24-bit RX components to userspace. Internally each component
+ * occupies four bytes: metadata, high sample byte, middle byte, low byte.
+ * The metadata bytes are removed in place before copy_to_user().
+ * IMPORTANT: the incoming count is overwritten by a protocol-derived size;
+ * this implementation does not obey the usual maximum-length read contract.
+ * Wait timeout is one second. Negative interrupted-wait results are not
+ * propagated. No sample sign conversion or signal processing happens here.
+ */
 ssize_t radioberry_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
     struct radioberry_client_ctx *ctx = file->private_data;
@@ -203,6 +245,15 @@ ssize_t radioberry_read(struct file *file, char __user *buf, size_t count, loff_
     return copied;
 }
 
+/*
+ * radioberry_write
+ *
+ * Copy userspace TX bytes into a temporary allocation, wait for FIFO space,
+ * then enqueue through rb2_tx_stream_write(). Success means queued, not sent
+ * over the GPIO pins. The byte stream must preserve four-byte I/Q framing.
+ * Known limitations: no length/alignment limit, a leaked allocation on the
+ * timeout path, and no TX-space wakeup in the current stream implementation.
+ */
 ssize_t radioberry_write(struct file *file, const char __user *buf, size_t len, loff_t *ppos)
 {
 	struct radioberry_client_ctx *ctx = file->private_data;
@@ -230,6 +281,14 @@ ssize_t radioberry_write(struct file *file, const char __user *buf, size_t len, 
     return written;
 }
 
+/*
+ * radioberry_open
+ *
+ * Admit one open file using the global mutex and attach the shared context.
+ * Reset software FIFOs, but do not reset PIO, in-flight DMA, RX metadata
+ * synchronization, or the FPGA FIFOs. The mutex is held until release; this
+ * is an existing lifetime/ownership design, not a per-operation lock.
+ */
 static int radioberry_open(struct inode *inode, struct file *filep)
 {
     printk(KERN_INFO "inside %s function \n", __FUNCTION__);
@@ -257,6 +316,12 @@ static int radioberry_open(struct inode *inode, struct file *filep)
     return 0;
 }
 
+/*
+ * radioberry_release
+ *
+ * Detach file-private data and release the exclusive-open mutex.
+ * This does not stop PIO or drain/cancel pending transmit data.
+ */
 static int radioberry_release(struct inode *inode, struct file *filep)
 {
     printk(KERN_INFO "inside %s function \n", __FUNCTION__);
@@ -271,6 +336,15 @@ static int radioberry_release(struct inode *inode, struct file *filep)
     return 0;
 }
 
+/*
+ * radioberry_ioctl
+ *
+ * Pack a control request into six SPI bytes and unpack returned board info.
+ * For command addresses 0/1, bits 5:3 of the final request byte select
+ * nrx minus one. Update RX metadata interpretation after the SPI call.
+ * The ABI uses rb_info_arg_t despite encoding only __u8 in the ioctl number.
+ * See docs/REVIEW.md for allocation, copy, initialization and race findings.
+ */
 static long radioberry_ioctl(struct file *fp, unsigned int cmd, unsigned long arg){
 	
 	//printk(KERN_INFO "inside %s function \n", __FUNCTION__);
@@ -336,6 +410,13 @@ static struct file_operations radioberry_fops = {
 	.unlocked_ioctl = radioberry_ioctl
 };
 
+/*
+ * radioberry_probe
+ *
+ * Resolve the device-tree pio phandle and associate RP1 driver data with
+ * the platform device. This probe does not configure the sample engines;
+ * those are configured separately by module initialization.
+ */
 static int radioberry_probe(struct platform_device *pdev)
 {
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);
@@ -391,6 +472,14 @@ static struct platform_driver radioberry_driver = {
 		.probe = radioberry_probe,
 };
 
+/*
+ * radioberry_init
+ *
+ * Register SPI/platform/character interfaces, map RP1 GPIO, load the FPGA,
+ * select radio pin functions, then configure RX/TX PIO and DMA resources.
+ * Several intermediate failures are not propagated or fully unwound.
+ * The character device is created before gctx_ready becomes true.
+ */
 static int __init radioberry_init(void) {
 	int retval;
 	size_t size;
@@ -451,6 +540,13 @@ static int __init radioberry_init(void) {
 	return result;
 }
 
+/*
+ * radioberry_exit
+ *
+ * Unregister interfaces and release GPIO/PIO resources on module unload.
+ * This documents the existing order; see the teardown audit in REVIEW.md
+ * for callback lifetime and resource ownership questions.
+ */
 static void __exit radioberry_exit(void) {
 
 	printk(KERN_INFO "inside %s function \n", __FUNCTION__);

@@ -34,6 +34,13 @@ void tx_iq_data_dma_callback(void *param);
 void tx_dma_restart_work(struct work_struct *w);
 
 
+/*
+ * radioberry_init_tx_ctx
+ *
+ * Initialize the TX software queue and restart bookkeeping.
+ * TX DMA blocks are 16384 bytes (4096 four-byte I/Q pairs). The completion
+ * objects are initialized/signalled but are not used by the transfer path.
+ */
 static int radioberry_init_tx_ctx(struct radioberry_client_ctx *ctx)
 {
     INIT_KFIFO(ctx->tx.dma_fifo);
@@ -55,6 +62,15 @@ static int radioberry_init_tx_ctx(struct radioberry_client_ctx *ctx)
     return 0;
 }
 
+/*
+ * configure_tx_iq_sm
+ *
+ * Configure serial TX: GPIO 5 data output, GPIO 4 clock output, GPIO 12
+ * ready input with pull-down. Claim an SM, configure two DMA buffers, load
+ * the nine-instruction PIO program and enable it. Initial DMA is deferred
+ * until the software FIFO contains a complete block. Some existing error
+ * messages incorrectly describe the input/output directions or pull state.
+ */
 int configure_tx_iq_sm(struct radioberry_client_ctx *ctx)
 {
     initialize_gpio_for_input(TX_SAMPLE_READY_PIN);
@@ -225,6 +241,13 @@ error_cleanup:
     return ret;
 }
 
+/*
+ * rb2_tx_stream_write
+ *
+ * Append raw TX bytes under the FIFO spinlock. If no DMA is active and a
+ * complete block is available, queue restart work. Return bytes enqueued.
+ * The function does not enforce that len is a multiple of an I/Q pair.
+ */
 ssize_t rb2_tx_stream_write(struct radioberry_stream *tx, const uint8_t *data, size_t len)
 {
     ssize_t written;
@@ -242,6 +265,17 @@ ssize_t rb2_tx_stream_write(struct radioberry_stream *tx, const uint8_t *data, s
     return written;
 }
 
+/*
+ * tx_dma_kick_now
+ *
+ * Remove one complete block from the TX FIFO and pack bytes into DMA words.
+ * For bytes [I_hi,I_lo,Q_hi,Q_lo], the word is (I_bits << 16) | Q_bits.
+ * The PIO output shifter sends bit 31 first. dma_wmb orders buffer writes
+ * before submitting the transfer to the external RP1 driver.
+ * May be reached from work or directly from the completion callback.
+ * Data is already removed if a subsequent buffer lookup/submission fails.
+ * Partial blocks remain queued; no tail flush or zero-fill is performed.
+ */
 static void tx_dma_kick_now(struct radioberry_stream *tx)
 {
     size_t avail;
@@ -290,12 +324,26 @@ static void tx_dma_kick_now(struct radioberry_stream *tx)
     }
 }
 
+/*
+ * tx_dma_restart_work
+ *
+ * Recover the stream owner from its work item and try to submit a block.
+ * This is the process-context entry used by writes and some completions.
+ */
 void tx_dma_restart_work(struct work_struct *w)
 {
     struct radioberry_stream *tx = container_of(w, struct radioberry_stream, dma_restart);
     tx_dma_kick_now(tx);
 }
 
+/*
+ * tx_iq_data_dma_callback
+ *
+ * Advance to the alternate DMA buffer and try to continue transmission.
+ * A full software block is submitted directly; otherwise queue work which
+ * will leave DMA idle if there is still too little data. No wake_up call
+ * notifies writers waiting for TX FIFO space in this implementation.
+ */
 void tx_iq_data_dma_callback(void *param)
 {
     struct radioberry_stream *tx = param;
@@ -312,6 +360,13 @@ void tx_iq_data_dma_callback(void *param)
     if (avail >= tx->dma_size) tx_dma_kick_now(tx); else schedule_work(&tx->dma_restart);
 }
 
+/*
+ * radioberry_cleanup_tx_ctx
+ *
+ * Cancel restart work, disable/unclaim the TX SM, remove the PIO program
+ * and close the client. This is resource cleanup, not a userspace TX flush.
+ * See REVIEW.md for the unresolved in-flight callback lifetime contract.
+ */
 void radioberry_cleanup_tx_ctx(struct radioberry_client_ctx *ctx)
 {
     if (ctx->tx.client && ctx->tx.sm >= 0) {
@@ -350,6 +405,13 @@ void radioberry_cleanup_tx_ctx(struct radioberry_client_ctx *ctx)
     }
 }
 
+/*
+ * PIO execution, not ARM instructions: 0/1 poll ready while pulsing clock;
+ * 2 lowers clock; 3 sets a 32-bit loop; 4 blocks for a FIFO word; 5 emits
+ * one MSB; 6 raises clock; 7 lowers it and loops; 8 returns to polling.
+ * Ready is tested once per word. Clock also toggles while waiting for ready.
+ * See docs/DRIVER_GUIDE.md for instruction timing and register decoding.
+ */
 const uint16_t tx_iq_sample_program_instructions[] = {
             //     .wrap_target
     0x1ac2, //  0: jmp    pin, 2          side 1 [2]
