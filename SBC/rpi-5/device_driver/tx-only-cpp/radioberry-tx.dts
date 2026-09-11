@@ -1,0 +1,36 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	compatible = "brcm,bcm2712";
+
+	/* The control device uses SPI0 chip select 0, so spidev0 must release it. */
+	fragment@0 {
+		target = <&spidev0>;
+		__overlay__ { status = "disabled"; };
+	};
+
+	/* The TX data stream uses the RP1 PIO service exported by rp1-pio. */
+	fragment@1 {
+		target = <&rp1_pio>;
+		__overlay__ { status = "okay"; };
+	};
+
+	fragment@2 {
+		target = <&spi0>;
+		__overlay__ {
+			status = "okay";
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			radioberry_tx_cpp@0 {
+				compatible = "radioberry,tx-only-cpp";
+				reg = <0>;
+				spi-max-frequency = <48000000>;
+				spi-cpol;
+				spi-cpha;
+				status = "okay";
+			};
+		};
+	};
+};
